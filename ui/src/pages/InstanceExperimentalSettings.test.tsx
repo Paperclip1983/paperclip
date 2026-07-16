@@ -84,6 +84,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableWorkspaceBranchReconcileForward: true,
     enableWorkspaceDirtyQuarantineRepair: true,
     enableWorktreeRunExecution: false,
+    worktreeRunExecutionInstanceNonce: null,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
   };
