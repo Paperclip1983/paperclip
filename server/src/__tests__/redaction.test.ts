@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   REDACTED_EVENT_VALUE,
+  findPlaintextCredentialEnvViolations,
   redactAgentAdapterConfig,
   redactEventPayload,
   redactSensitiveText,
@@ -209,5 +210,105 @@ describe("redaction", () => {
       command: "pnpm agent:run",
       apiKey: REDACTED_EVENT_VALUE,
     });
+  });
+});
+
+describe("findPlaintextCredentialEnvViolations", () => {
+  const plain = (value: string) => ({ type: "plain", value });
+
+  // Stand-in for a credential value. Deliberately not a real token shape — no
+  // secret material belongs in this repo (TEC-7063).
+  const SAMPLE_CREDENTIAL = "***SAMPLE***";
+
+  it("flags plaintext bindings whose env name matches a credential pattern", () => {
+    const violations = findPlaintextCredentialEnvViolations({
+      GITHUB_TOKEN: plain(SAMPLE_CREDENTIAL),
+      OPENAI_API_KEY: plain(SAMPLE_CREDENTIAL),
+      DB_PASSWORD: plain(SAMPLE_CREDENTIAL),
+      CLIENT_SECRET: plain(SAMPLE_CREDENTIAL),
+      GH_PAT: plain(SAMPLE_CREDENTIAL),
+    });
+
+    expect(violations.sort()).toEqual([
+      "CLIENT_SECRET",
+      "DB_PASSWORD",
+      "GH_PAT",
+      "GITHUB_TOKEN",
+      "OPENAI_API_KEY",
+    ]);
+  });
+
+  it("flags a long opaque plaintext value even under a neutral env name", () => {
+    // 41 chars: one over the permissive lower bound.
+    const opaque = "a".repeat(41);
+    expect(opaque.length).toBe(41);
+
+    expect(findPlaintextCredentialEnvViolations({ SESSION_BLOB: plain(opaque) })).toEqual([
+      "SESSION_BLOB",
+    ]);
+  });
+
+  it("leaves non-credential env entries alone", () => {
+    expect(
+      findPlaintextCredentialEnvViolations({
+        NODE_ENV: plain("production"),
+        LOG_LEVEL: plain("debug"),
+      }),
+    ).toEqual([]);
+  });
+
+  it("does not flag long values that are paths, URLs, or command lines", () => {
+    // Each is over the length bound but is ordinary configuration, not a secret.
+    // Without these carve-outs the control misfires on everyday env vars.
+    expect(
+      findPlaintextCredentialEnvViolations({
+        PATH: plain("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+        HOME_DIR: plain("~/paperclip/companies/acme/agents/codex-home"),
+        PAPERCLIP_API_URL: plain("http://localhost:3100/api/companies/acme/agents"),
+        RUN_COMMAND: plain("pnpm --filter server exec vitest run --reporter dot"),
+      }),
+    ).toEqual([]);
+  });
+
+  it("does not misclassify PATH-like names as Personal Access Tokens", () => {
+    expect(
+      findPlaintextCredentialEnvViolations({
+        PATH: plain("/usr/bin"),
+        COMPATIBILITY_MODE: plain("legacy"),
+      }),
+    ).toEqual([]);
+  });
+
+  it("skips redacted sentinels so a round-tripped GET response is not rejected", () => {
+    // `restoreRedactedAgentEnv` maps these back to the stored value on PATCH;
+    // the sentinel is not a real credential and must not trigger rejection.
+    expect(
+      findPlaintextCredentialEnvViolations({
+        GITHUB_TOKEN: plain(REDACTED_EVENT_VALUE),
+        OPENAI_API_KEY: plain(REDACTED_EVENT_VALUE),
+      }),
+    ).toEqual([]);
+  });
+
+  it("skips empty plaintext values, which clear rather than set a credential", () => {
+    expect(findPlaintextCredentialEnvViolations({ GITHUB_TOKEN: plain("") })).toEqual([]);
+  });
+
+  it("allows secret_ref and user_secret_ref bindings for credential-shaped names", () => {
+    expect(
+      findPlaintextCredentialEnvViolations({
+        GITHUB_TOKEN: {
+          type: "secret_ref",
+          secretId: "11111111-1111-1111-1111-111111111111",
+        },
+        OPENAI_API_KEY: { type: "user_secret_ref", key: "openai" },
+      }),
+    ).toEqual([]);
+  });
+
+  it("returns no violations for a missing or non-object env block", () => {
+    expect(findPlaintextCredentialEnvViolations(undefined)).toEqual([]);
+    expect(findPlaintextCredentialEnvViolations(null)).toEqual([]);
+    expect(findPlaintextCredentialEnvViolations("env")).toEqual([]);
   });
 });
