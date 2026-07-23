@@ -162,6 +162,78 @@ export function redactAgentAdapterConfig(
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
 }
 
+// --- Write-side plaintext-credential rejection (TEC-7063) -----------------
+//
+// The redaction helpers above protect secrets on the way *out* (GET/list/
+// mutation responses). The matcher below is the write-side counterpart: it
+// flags incoming `adapterConfig.env` entries that carry a raw plaintext
+// credential value so the route handlers can reject them with a 400 and steer
+// callers toward `secret_ref` / `user_secret_ref` bindings.
+
+// Credential name patterns per TEC-7063: *TOKEN*, *KEY*, *SECRET*, *PASSWORD*,
+// *PAT*. TOKEN/KEY/SECRET/PASSWORD(/PASSWD) match as substrings; "PAT" matches
+// only as a delimited segment so ubiquitous non-secret vars like PATH or
+// COMPATIBILITY are not misclassified as Personal Access Tokens.
+const CREDENTIAL_NAME_SUBSTRING_RE = /(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD)/i;
+const CREDENTIAL_NAME_PAT_SEGMENT_RE = /(?:^|[^A-Za-z])PAT(?:$|[^A-Za-z])/i;
+
+// Permissive lower bound for the value-shape heuristic: a plaintext value longer
+// than this is treated as a likely high-entropy secret regardless of its env name.
+const CREDENTIAL_VALUE_MIN_LENGTH = 40;
+
+// Length alone is not enough. Plenty of legitimate env values are long — PATH
+// (`/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` is 44 chars), CODEX_HOME,
+// service URLs, command lines. A credential is a single opaque token, so the
+// heuristic additionally requires the value to carry no whitespace and to look
+// like neither a URL nor a filesystem path. Without these carve-outs the control
+// misfires on everyday config and callers learn to route around it.
+const URL_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+const FILESYSTEM_PATH_VALUE_RE = /^[~.]?\//;
+
+export function isCredentialEnvName(name: string): boolean {
+  return CREDENTIAL_NAME_SUBSTRING_RE.test(name) || CREDENTIAL_NAME_PAT_SEGMENT_RE.test(name);
+}
+
+export function isLikelyCredentialValue(value: string): boolean {
+  if (value.length <= CREDENTIAL_VALUE_MIN_LENGTH) return false;
+  if (/\s/.test(value)) return false;
+  if (URL_VALUE_RE.test(value)) return false;
+  if (FILESYSTEM_PATH_VALUE_RE.test(value)) return false;
+  return true;
+}
+
+// Extract the candidate plaintext string from an env binding. Rejection is
+// deliberately scoped to the explicit `{ type: "plain", value: <string> }`
+// binding shape (TEC-7063). Bare-string env values are left to the persistence
+// layer's secret normalization; secret_ref / user_secret_ref bindings and
+// non-string plain values carry no plaintext to reject.
+function plaintextEnvValue(binding: unknown): string | null {
+  if (isPlainBinding(binding) && typeof binding.value === "string") return binding.value;
+  return null;
+}
+
+/**
+ * Return the names of `env` entries that carry a rejectable plaintext credential
+ * value — either a credential-shaped name or a value over the length heuristic.
+ *
+ * Redacted sentinels (`***REDACTED***`) and empty values are skipped: a client
+ * round-tripping a redacted GET response back through PATCH is legitimate and is
+ * mapped back to the stored value by `restoreRedactedAgentEnv`.
+ */
+export function findPlaintextCredentialEnvViolations(env: unknown): string[] {
+  if (!isPlainObject(env)) return [];
+  const violations: string[] = [];
+  for (const [name, binding] of Object.entries(env)) {
+    const value = plaintextEnvValue(binding);
+    if (value === null || value.length === 0) continue;
+    if (value === REDACTED_EVENT_VALUE) continue;
+    if (isCredentialEnvName(name) || isLikelyCredentialValue(value)) {
+      violations.push(name);
+    }
+  }
+  return violations;
+}
+
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(

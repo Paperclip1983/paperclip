@@ -53,7 +53,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -82,6 +82,7 @@ import {
 } from "../adapters/index.js";
 import {
   REDACTED_EVENT_VALUE,
+  findPlaintextCredentialEnvViolations,
   redactAgentAdapterConfig,
   redactEventPayload,
 } from "../redaction.js";
@@ -1698,6 +1699,30 @@ export function agentRoutes(
     return { ...requestedConfig, env: restoredEnv };
   }
 
+  // Reject writes that inject a new plaintext credential into `adapterConfig.env`
+  // (TEC-7063). Validate the caller-supplied config *before* server-side defaults
+  // are merged, and before `restoreRedactedAgentEnv` swaps redaction sentinels
+  // back to stored values — the matcher itself skips sentinels, so a round-tripped
+  // redacted GET response is never rejected. The rejected value is never echoed.
+  function assertNoPlaintextCredentialEnv(adapterConfig: Record<string, unknown>) {
+    const env = asRecord(adapterConfig.env);
+    if (!env) return;
+    const violations = findPlaintextCredentialEnvViolations(env);
+    if (violations.length === 0) return;
+    const names = violations.join(", ");
+    throw badRequest(
+      `Plaintext credential value not allowed for adapterConfig.env ${names}; `
+        + "use type: 'secret_ref' or type: 'user_secret_ref' instead.",
+      {
+        code: "plaintext_credential_rejected",
+        envNames: violations,
+        remediation:
+          "Replace { type: 'plain', value } with { type: 'secret_ref', secretId } "
+          + "or { type: 'user_secret_ref', key }.",
+      },
+    );
+  }
+
   function redactRevisionSnapshot(snapshot: unknown): Record<string, unknown> {
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return {};
     const record = snapshot as Record<string, unknown>;
@@ -2597,6 +2622,7 @@ export function agentRoutes(
       rawCreateAdapterConfig,
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
+    assertNoPlaintextCredentialEnv(rawCreateAdapterConfig);
     assertNoAgentRuntimeConfigAdapterConfigMutation(req, createInput.runtimeConfig);
     const agentId = randomUUID();
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
@@ -2994,6 +3020,7 @@ export function agentRoutes(
         return;
       }
       assertNoAgentAdapterConfigMutation(req, adapterConfig);
+      assertNoPlaintextCredentialEnv(adapterConfig);
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
