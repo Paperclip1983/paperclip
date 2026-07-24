@@ -1133,13 +1133,13 @@ export function agentRoutes(
   };
 
   function applyAdapterConfigUserLockPolicy(input: {
-    actorType: "board" | "agent" | "none";
+    actorType: "user" | "agent";
     existing: Record<string, unknown>;
     requested: Record<string, unknown>;
     effective: Record<string, unknown>;
   }): { config: Record<string, unknown>; mutation: AdapterConfigMutation | null } {
     const attemptedPaths = changedAdapterConfigPaths(input.existing, input.effective);
-    if (input.actorType === "board") {
+    if (input.actorType === "user") {
       const baseLocks = hasOwn(input.requested, "_userLocked")
         ? readAdapterConfigUserLocks(input.requested)
         : readAdapterConfigUserLocks(input.existing);
@@ -3184,6 +3184,7 @@ export function agentRoutes(
     }
 
     const patchData = { ...(req.body as Record<string, unknown>) };
+    const actor = getActorInfo(req);
     let adapterConfigMutation: AdapterConfigMutation | null = null;
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
@@ -3254,7 +3255,7 @@ export function agentRoutes(
       }
       if (requestedAdapterConfig) {
         const lockPolicy = applyAdapterConfigUserLockPolicy({
-          actorType: req.actor.type,
+          actorType: actor.actorType,
           existing: existingAdapterConfig,
           requested: requestedAdapterConfig,
           effective: rawEffectiveAdapterConfig,
@@ -3309,7 +3310,6 @@ export function agentRoutes(
       await assertCanUpdateAgent(req, existing);
     }
 
-    const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
       recordRevision: {
         createdByAgentId: actor.agentId,

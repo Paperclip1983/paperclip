@@ -602,6 +602,59 @@ describe("agent instructions bundle routes", () => {
     );
   });
 
+  it.each([
+    {
+      label: "user",
+      actor: boardActor(),
+      existingAdapterConfig: { model: "gpt-5.4" },
+      expectedModel: "gpt-5.6",
+      expectedActorType: "user",
+    },
+    {
+      label: "agent",
+      actor: {
+        type: "agent",
+        agentId: "agent-editor",
+        companyId: "company-1",
+        source: "agent_key",
+      },
+      existingAdapterConfig: { model: "gpt-5.4", _userLocked: ["model"] },
+      expectedModel: "gpt-5.4",
+      expectedActorType: "agent",
+    },
+  ])("uses canonical $label attribution for lock policy and activity", async ({
+    actor,
+    existingAdapterConfig,
+    expectedModel,
+    expectedActorType,
+  }) => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: existingAdapterConfig,
+    });
+
+    const res = await requestApp(await createApp(actor), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+      .send({ adapterConfig: { model: "gpt-5.6" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({
+        adapterConfig: expect.objectContaining({
+          model: expectedModel,
+          _userLocked: ["model"],
+        }),
+      }),
+      expect.any(Object),
+    );
+    const activityEntries = mockLogActivity.mock.calls.map(([, entry]) => entry);
+    expect(activityEntries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "agent.updated", actorType: expectedActorType }),
+    ]));
+    expect(activityEntries.every((entry) => entry.actorType === expectedActorType)).toBe(true);
+  });
+
   it("allows an explicit unlock while locking fields changed in the same user patch", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent(),
