@@ -607,7 +607,8 @@ describe("agent instructions bundle routes", () => {
       label: "user",
       actor: boardActor(),
       existingAdapterConfig: { model: "gpt-5.4" },
-      expectedModel: "gpt-5.6",
+      requestedAdapterConfig: { model: "gpt-5.6" },
+      expectedAdapterConfig: { model: "gpt-5.6", _userLocked: ["model"] },
       expectedActorType: "user",
     },
     {
@@ -618,14 +619,21 @@ describe("agent instructions bundle routes", () => {
         companyId: "company-1",
         source: "agent_key",
       },
-      existingAdapterConfig: { model: "gpt-5.4", _userLocked: ["model"] },
-      expectedModel: "gpt-5.4",
+      existingAdapterConfig: { paperclipSkillSync: { desiredSkills: ["research"] } },
+      requestedAdapterConfig: {
+        paperclipSkillSync: { desiredSkills: ["research", "code-review"] },
+      },
+      expectedAdapterConfig: {
+        paperclipSkillSync: { desiredSkills: ["research", "code-review"] },
+        _userLocked: [],
+      },
       expectedActorType: "agent",
     },
   ])("uses canonical $label attribution for lock policy and activity", async ({
     actor,
     existingAdapterConfig,
-    expectedModel,
+    requestedAdapterConfig,
+    expectedAdapterConfig,
     expectedActorType,
   }) => {
     mockAgentService.getById.mockResolvedValue({
@@ -635,16 +643,13 @@ describe("agent instructions bundle routes", () => {
 
     const res = await requestApp(await createApp(actor), (baseUrl) => request(baseUrl)
       .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
-      .send({ adapterConfig: { model: "gpt-5.6" } }));
+      .send({ adapterConfig: requestedAdapterConfig }));
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockAgentService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       expect.objectContaining({
-        adapterConfig: expect.objectContaining({
-          model: expectedModel,
-          _userLocked: ["model"],
-        }),
+        adapterConfig: expect.objectContaining(expectedAdapterConfig),
       }),
       expect.any(Object),
     );
