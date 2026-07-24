@@ -56,7 +56,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -1129,8 +1129,44 @@ export function agentRoutes(
   type AdapterConfigMutation = {
     changedPaths: string[];
     skippedPaths: string[];
+    strippedPaths: string[];
     fields: Array<{ path: string; type: string; count: number }>;
   };
+
+  function enforceAgentAdapterConfigAllowlist(input: {
+    existing: Record<string, unknown>;
+    requested: Record<string, unknown>;
+    responsibleUserId: string | null;
+  }): {
+    requested: Record<string, unknown>;
+    strippedPaths: string[];
+    lockedPaths: string[];
+    fields: Array<{ path: string; type: string; count: number }>;
+  } {
+    if (input.responsibleUserId !== null) {
+      return { requested: input.requested, strippedPaths: [], lockedPaths: [], fields: [] };
+    }
+
+    const requestedPaths = changedAdapterConfigPaths({}, input.requested);
+    const strippedPaths = requestedPaths.filter((path) => path !== "paperclipSkillSync.desiredSkills");
+    const lockedPaths = strippedPaths.filter((path) =>
+      adapterConfigPathIsUserLocked(input.existing, path),
+    );
+    const skillSync = asRecord(input.requested.paperclipSkillSync);
+    const requested = skillSync && hasOwn(skillSync, "desiredSkills")
+      ? { paperclipSkillSync: { desiredSkills: skillSync.desiredSkills } }
+      : {};
+
+    return {
+      requested,
+      strippedPaths,
+      lockedPaths,
+      fields: strippedPaths.map((path) => ({
+        path,
+        ...adapterConfigValueShape(readAdapterConfigPath(input.requested, path)),
+      })),
+    };
+  }
 
   function applyAdapterConfigUserLockPolicy(input: {
     actorType: "user" | "agent";
@@ -1172,6 +1208,7 @@ export function agentRoutes(
         skippedPaths: attemptedPaths.filter((path) =>
           adapterConfigPathIsUserLocked(input.existing, path),
         ),
+        strippedPaths: [],
         fields: attemptedPaths.map((path) => ({
           path,
           ...adapterConfigValueShape(readAdapterConfigPath(config, path)),
@@ -1187,6 +1224,7 @@ export function agentRoutes(
     runId: string | null;
     changedPaths: string[];
     skippedPaths: string[];
+    strippedPaths: string[];
     fields: Array<{ path: string; type: string; count: number }>;
   }) {
     if (!input.runId) return;
@@ -1217,6 +1255,7 @@ export function agentRoutes(
         ...fieldRows,
         `- Changed fields: ${input.changedPaths.length}`,
         `- Skipped user-locked fields: ${input.skippedPaths.length}`,
+        `- Stripped fields: ${input.strippedPaths.length}${input.strippedPaths.length > 0 ? ` (${input.strippedPaths.map((path) => `\`${path}\``).join(", ")})` : ""}`,
       ].join("\n"),
       { agentId: input.agentId, runId: input.runId },
     );
@@ -2171,6 +2210,7 @@ export function agentRoutes(
         const adapterConfigMutation = {
           changedPaths: desiredSkillsLocked ? [] : ["paperclipSkillSync.desiredSkills"],
           skippedPaths: desiredSkillsLocked ? ["paperclipSkillSync.desiredSkills"] : [],
+          strippedPaths: [],
           fields: [{
             path: "paperclipSkillSync.desiredSkills",
             type: "array",
@@ -3185,7 +3225,9 @@ export function agentRoutes(
 
     const patchData = { ...(req.body as Record<string, unknown>) };
     const actor = getActorInfo(req);
+    const responsibleUserId = req.actor.userId ?? req.actor.onBehalfOfUserId ?? null;
     let adapterConfigMutation: AdapterConfigMutation | null = null;
+    let strippedAdapterConfigMutation: Pick<AdapterConfigMutation, "strippedPaths" | "fields"> | null = null;
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
     if (hasOwn(patchData, "adapterConfig")) {
@@ -3194,12 +3236,55 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
-      assertNoAgentAdapterConfigMutation(req, adapterConfig);
-      const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
+      const allowlist = enforceAgentAdapterConfigAllowlist({
+        existing: asRecord(existing.adapterConfig) ?? {},
+        requested: adapterConfig,
+        responsibleUserId,
+      });
+      if (allowlist.lockedPaths.length > 0) {
+        const refusedMutation: AdapterConfigMutation = {
+          changedPaths: [],
+          skippedPaths: allowlist.lockedPaths,
+          strippedPaths: allowlist.strippedPaths,
+          fields: allowlist.fields,
+        };
+        await logActivity(db, {
+          companyId: existing.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "agent.adapter_config_change_skipped",
+          entityType: "agent",
+          entityId: existing.id,
+          details: {
+            fields: refusedMutation.fields,
+            changedCount: 0,
+            skippedCount: refusedMutation.skippedPaths.length,
+            strippedCount: refusedMutation.strippedPaths.length,
+          },
+        });
+        await commentOnLinkedParentForAdapterConfigMutation({
+          companyId: existing.companyId,
+          agentId: actor.agentId!,
+          agentName: existing.name,
+          runId: actor.runId ?? null,
+          ...refusedMutation,
+        });
+        throw badRequest(
+          `Agent-initiated adapterConfig update includes user-locked fields outside the allowlist: ${allowlist.lockedPaths.join(", ")}`,
+        );
+      }
+      strippedAdapterConfigMutation = allowlist.strippedPaths.length > 0
+        ? { strippedPaths: allowlist.strippedPaths, fields: allowlist.fields }
+        : null;
+      assertNoAgentAdapterConfigMutation(req, allowlist.requested);
+      const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(allowlist.requested);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
       }
-      patchData.adapterConfig = adapterConfig;
+      patchData.adapterConfig = allowlist.requested;
     }
 
     const requestedAdapterType = hasOwn(patchData, "adapterType")
@@ -3228,6 +3313,7 @@ export function agentRoutes(
       if (
         requestedAdapterConfig
         && replaceAdapterConfig
+        && responsibleUserId !== null
         && KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) =>
           existingAdapterConfig[key] !== undefined && requestedAdapterConfig[key] === undefined,
         )
@@ -3235,7 +3321,11 @@ export function agentRoutes(
         await assertCanManageInstructionsPath(req, existing);
       }
       let rawEffectiveAdapterConfig = requestedAdapterConfig ?? existingAdapterConfig;
-      if (requestedAdapterConfig && !changingAdapterType && !replaceAdapterConfig) {
+      if (
+        requestedAdapterConfig
+        && !changingAdapterType
+        && (!replaceAdapterConfig || responsibleUserId === null)
+      ) {
         rawEffectiveAdapterConfig = mergeAdapterConfigPatch(existingAdapterConfig, requestedAdapterConfig);
       }
       if (changingAdapterType) {
@@ -3255,13 +3345,21 @@ export function agentRoutes(
       }
       if (requestedAdapterConfig) {
         const lockPolicy = applyAdapterConfigUserLockPolicy({
-          actorType: actor.actorType,
+          actorType: responsibleUserId === null ? "agent" : "user",
           existing: existingAdapterConfig,
           requested: requestedAdapterConfig,
           effective: rawEffectiveAdapterConfig,
         });
         rawEffectiveAdapterConfig = lockPolicy.config;
         adapterConfigMutation = lockPolicy.mutation;
+        if (adapterConfigMutation && strippedAdapterConfigMutation) {
+          adapterConfigMutation = {
+            ...adapterConfigMutation,
+            strippedPaths: strippedAdapterConfigMutation.strippedPaths,
+            fields: [...adapterConfigMutation.fields, ...strippedAdapterConfigMutation.fields]
+              .sort((left, right) => left.path.localeCompare(right.path)),
+          };
+        }
       }
       const effectiveAdapterConfig = applyCodexLocalKeyIsolation(
         existing.companyId,
@@ -3345,13 +3443,16 @@ export function agentRoutes(
         agentApiKeyId: actor.agentApiKeyId,
         action: adapterConfigMutation.skippedPaths.length > 0
           ? "agent.adapter_config_change_skipped"
-          : "agent.adapter_config_changed",
+          : adapterConfigMutation.strippedPaths.length > 0
+            ? "agent.adapter_config_change_stripped"
+            : "agent.adapter_config_changed",
         entityType: "agent",
         entityId: agent.id,
         details: {
           fields: adapterConfigMutation.fields,
           changedCount: adapterConfigMutation.changedPaths.length,
           skippedCount: adapterConfigMutation.skippedPaths.length,
+          strippedCount: adapterConfigMutation.strippedPaths.length,
         },
       });
       await commentOnLinkedParentForAdapterConfigMutation({

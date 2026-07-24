@@ -688,7 +688,42 @@ describe("agent instructions bundle routes", () => {
     );
   });
 
-  it("skips agent changes to locked fields and surfaces only redacted shapes", async () => {
+  it("allows agent changes to paperclipSkillSync.desiredSkills", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        model: "gpt-5.4",
+        paperclipSkillSync: { desiredSkills: ["research"] },
+      },
+    });
+
+    const res = await requestApp(await createApp({
+      type: "agent",
+      agentId: "agent-editor",
+      companyId: "company-1",
+      source: "agent_key",
+    }), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+      .send({
+        adapterConfig: {
+          paperclipSkillSync: { desiredSkills: ["research", "code-review"] },
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        adapterConfig: expect.objectContaining({
+          model: "gpt-5.4",
+          paperclipSkillSync: { desiredSkills: ["research", "code-review"] },
+        }),
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("rejects agent changes to locked fields and surfaces only redacted shapes", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent(),
       adapterConfig: {
@@ -715,19 +750,9 @@ describe("agent instructions bundle routes", () => {
         },
       }));
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockAgentService.update).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      expect.objectContaining({
-        adapterConfig: expect.objectContaining({
-          model: "gpt-5.4",
-          command: "codex --profile engineer",
-          env: { SECRET_TOKEN: "old-secret-value" },
-          _userLocked: ["model", "env"],
-        }),
-      }),
-      expect.any(Object),
-    );
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toContain("user-locked fields outside the allowlist: env, model");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -738,8 +763,9 @@ describe("agent instructions bundle routes", () => {
             { path: "env", type: "object", count: 1 },
             { path: "model", type: "string", count: 1 },
           ]),
-          changedCount: 1,
+          changedCount: 0,
           skippedCount: 2,
+          strippedCount: 3,
         },
       }),
     );
@@ -747,7 +773,7 @@ describe("agent instructions bundle routes", () => {
     expect(JSON.stringify(mockLogActivity.mock.calls)).not.toContain("new-secret-value");
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       "44444444-4444-4444-8444-444444444444",
-      expect.stringContaining("Skipped user-locked fields: 2"),
+      expect.stringContaining("Stripped fields: 3 (`command`, `env`, `model`)"),
       {
         agentId: "agent-editor",
         runId: "55555555-5555-4555-8555-555555555555",
@@ -757,7 +783,60 @@ describe("agent instructions bundle routes", () => {
     expect(JSON.stringify(mockIssueService.addComment.mock.calls)).not.toContain("new-secret-value");
   });
 
-  it("preserves a nested locked field when an agent requests full replacement", async () => {
+  it("strips unlocked agent fields, records the strip, and does not introduce env values", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        model: "gpt-5.4",
+        paperclipSkillSync: { desiredSkills: ["research"] },
+      },
+    });
+
+    const res = await requestApp(await createApp({
+      type: "agent",
+      agentId: "agent-editor",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_key",
+    }, linkedIssueDb()), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+      .send({
+        replaceAdapterConfig: true,
+        adapterConfig: {
+          env: { NEW_VAR: "test-placeholder" },
+          instructionsFilePath: "/tmp/untrusted",
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updatePatch = mockAgentService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(updatePatch.adapterConfig).toMatchObject({
+      model: "gpt-5.4",
+      paperclipSkillSync: { desiredSkills: ["research"] },
+      _userLocked: [],
+    });
+    expect(JSON.stringify(updatePatch)).not.toContain("NEW_VAR");
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.adapter_config_change_stripped",
+        details: expect.objectContaining({
+          changedCount: 0,
+          skippedCount: 0,
+          strippedCount: 2,
+        }),
+      }),
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "44444444-4444-4444-8444-444444444444",
+      expect.stringContaining("Stripped fields: 2 (`env`, `instructionsFilePath`)"),
+      expect.any(Object),
+    );
+    expect(JSON.stringify(mockLogActivity.mock.calls)).not.toContain("test-placeholder");
+    expect(JSON.stringify(mockIssueService.addComment.mock.calls)).not.toContain("test-placeholder");
+  });
+
+  it("ignores replace semantics and preserves config when an agent sends only disallowed fields", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent(),
       adapterConfig: {
@@ -787,8 +866,8 @@ describe("agent instructions bundle routes", () => {
       expect.any(String),
       expect.objectContaining({
         adapterConfig: expect.objectContaining({
-          model: "gpt-5.6",
-          paperclipSkillSync: { desiredSkills: ["research"] },
+          model: "gpt-5.4",
+          paperclipSkillSync: expect.objectContaining({ desiredSkills: ["research"] }),
           _userLocked: ["paperclipSkillSync.desiredSkills"],
         }),
       }),
