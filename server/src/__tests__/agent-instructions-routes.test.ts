@@ -996,6 +996,109 @@ describe("agent instructions bundle routes", () => {
     );
   });
 
+  it("classifies an agent acting on behalf of a user as an agent for the lock policy (TEC-7267)", async () => {
+    // An agent JWT/key acting on behalf of a user populates `onBehalfOfUserId`.
+    // The lock policy must key off `req.actor.type`, not the presence of a
+    // responsible user id — otherwise the agent is misclassified as a user and
+    // the locked `paperclipSkillSync.desiredSkills` restore is bypassed.
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        model: "gpt-5.4",
+        paperclipSkillSync: { desiredSkills: ["research"] },
+        _userLocked: ["paperclipSkillSync.desiredSkills"],
+      },
+    });
+
+    const res = await requestApp(await createApp({
+      type: "agent",
+      agentId: "agent-editor",
+      companyId: "company-1",
+      onBehalfOfUserId: "88888888-8888-4888-8888-888888888888",
+      onBehalfOfMemberships: [
+        { companyId: "company-1", status: "active", membershipRole: "member" },
+      ],
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_key",
+    }, linkedIssueDb()), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+      .send({
+        adapterConfig: {
+          paperclipSkillSync: { desiredSkills: ["research", "code-review"] },
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updatePatch = mockAgentService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    // The locked value is restored: the agent's attempted change is discarded.
+    expect(updatePatch.adapterConfig).toMatchObject({
+      paperclipSkillSync: { desiredSkills: ["research"] },
+      _userLocked: ["paperclipSkillSync.desiredSkills"],
+    });
+    // The activity log records the skip rather than a persisted change.
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.adapter_config_change_skipped",
+        details: expect.objectContaining({
+          changedCount: 0,
+          skippedCount: 1,
+          strippedCount: 0,
+        }),
+      }),
+    );
+    // No `_userLocked` entry is authored for an agent attempt.
+    expect((updatePatch.adapterConfig as Record<string, unknown>)._userLocked)
+      .toEqual(["paperclipSkillSync.desiredSkills"]);
+  });
+
+  it("does not report an allowed nested desiredSkills write as a stripped path (TEC-7267)", async () => {
+    // The allowlist audit path enumeration must reach the leaf so the allowed
+    // `paperclipSkillSync.desiredSkills` write is not misreported as a strip of
+    // its top-level `paperclipSkillSync` parent.
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        model: "gpt-5.4",
+        paperclipSkillSync: { desiredSkills: ["research"] },
+      },
+    });
+
+    const res = await requestApp(await createApp({
+      type: "agent",
+      agentId: "agent-editor",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_key",
+    }, linkedIssueDb()), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+      .send({
+        adapterConfig: {
+          paperclipSkillSync: { desiredSkills: ["research", "code-review"] },
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // The write is persisted as a normal change, not a strip.
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.adapter_config_changed",
+        details: expect.objectContaining({ strippedCount: 0 }),
+      }),
+    );
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "agent.adapter_config_change_stripped" }),
+    );
+    // The linked-parent comment must not report a stripped path.
+    const commentBodies = mockIssueService.addComment.mock.calls.map((call) => String(call[1]));
+    for (const body of commentBodies) {
+      expect(body).not.toContain("Stripped fields: 1");
+      expect(body).not.toContain("`paperclipSkillSync`");
+    }
+  });
+
   it("replaces adapter config when replaceAdapterConfig is true", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent(),

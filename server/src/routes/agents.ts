@@ -1133,6 +1133,35 @@ export function agentRoutes(
     return value;
   }
 
+  // Enumerate every leaf path an agent actually sent in a requested adapterConfig
+  // so the allowlist can decide, per leaf, whether a write is the allowed
+  // `paperclipSkillSync.desiredSkills` or a stripped extra. Unlike
+  // `changedAdapterConfigPaths({}, requested)` (which stops at top-level keys
+  // because the empty `before` never recurses), this walks nested objects to the
+  // leaf. `env` is collapsed to a single leaf and `_userLocked` is skipped so
+  // individual environment variable names never surface in audit paths.
+  function enumerateRequestedAdapterConfigPaths(
+    config: Record<string, unknown>,
+    prefix = "",
+  ): string[] {
+    const paths: string[] = [];
+    for (const key of Object.keys(config)) {
+      if (key === "_userLocked") continue;
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (path === "env") {
+        paths.push(path);
+        continue;
+      }
+      const record = asRecord(config[key]);
+      if (record && Object.keys(record).length > 0) {
+        paths.push(...enumerateRequestedAdapterConfigPaths(record, path));
+      } else {
+        paths.push(path);
+      }
+    }
+    return paths.sort();
+  }
+
   type AdapterConfigMutation = {
     changedPaths: string[];
     skippedPaths: string[];
@@ -1154,13 +1183,14 @@ export function agentRoutes(
       return { requested: input.requested, strippedPaths: [], lockedPaths: [], fields: [] };
     }
 
-    // Compare each requested path against the existing config so that a no-op
-    // patch (an agent re-sending a value identical to the current one) is not
-    // recorded as a strip. `changedAdapterConfigPaths({}, requested)` yields the
-    // top-level keys the agent actually sent; we intentionally keep that
-    // key-space (a partial patch must not treat omitted existing keys as
+    // Compare each requested leaf path against the existing config so that a
+    // no-op patch (an agent re-sending a value identical to the current one) is
+    // not recorded as a strip, and — critically — so that an allowed nested
+    // write (`paperclipSkillSync.desiredSkills`) is not misreported as a strip
+    // of its top-level parent. We enumerate the full leaf key-space the agent
+    // actually sent (a partial patch must not treat omitted existing keys as
     // changes) and drop paths whose requested value already matches existing.
-    const requestedPaths = changedAdapterConfigPaths({}, input.requested);
+    const requestedPaths = enumerateRequestedAdapterConfigPaths(input.requested);
     const strippedPaths = requestedPaths.filter(
       (path) =>
         path !== "paperclipSkillSync.desiredSkills" &&
@@ -3253,7 +3283,6 @@ export function agentRoutes(
       await assertCanUpdateAgent(req, existing);
     }
     const actor = getActorInfo(req);
-    const responsibleUserId = req.actor.userId ?? req.actor.onBehalfOfUserId ?? null;
     let adapterConfigMutation: AdapterConfigMutation | null = null;
     let strippedAdapterConfigMutation: Pick<AdapterConfigMutation, "strippedPaths" | "fields"> | null = null;
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
@@ -3283,7 +3312,7 @@ export function agentRoutes(
       // User/board callers still gate instruction-path changes through the
       // protected-change permission. Agent callers never reach here for
       // sensitive keys (rejected above) and have path pointers stripped below.
-      if (responsibleUserId !== null && adapterConfigTouchesInstructionsConfig(adapterConfig)) {
+      if (req.actor.type !== "agent" && adapterConfigTouchesInstructionsConfig(adapterConfig)) {
         await assertCanManageInstructionsPath(req, existing);
       }
       const allowlist = enforceAgentAdapterConfigAllowlist({
@@ -3358,7 +3387,7 @@ export function agentRoutes(
       if (
         requestedAdapterConfig
         && replaceAdapterConfig
-        && responsibleUserId !== null
+        && req.actor.type !== "agent"
         && KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) =>
           existingAdapterConfig[key] !== undefined && requestedAdapterConfig[key] === undefined,
         )
@@ -3369,7 +3398,7 @@ export function agentRoutes(
       if (
         requestedAdapterConfig
         && !changingAdapterType
-        && (!replaceAdapterConfig || responsibleUserId === null)
+        && (!replaceAdapterConfig || req.actor.type === "agent")
       ) {
         rawEffectiveAdapterConfig = mergeAdapterConfigPatch(existingAdapterConfig, requestedAdapterConfig);
       }
@@ -3390,7 +3419,7 @@ export function agentRoutes(
       }
       if (requestedAdapterConfig) {
         const lockPolicy = applyAdapterConfigUserLockPolicy({
-          actorType: responsibleUserId === null ? "agent" : "user",
+          actorType: req.actor.type === "agent" ? "agent" : "user",
           existing: existingAdapterConfig,
           requested: requestedAdapterConfig,
           effective: rawEffectiveAdapterConfig,
