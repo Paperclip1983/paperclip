@@ -1027,4 +1027,123 @@ describe("agent instructions bundle routes", () => {
     expect(res.body.adapterConfig.instructionsEntryFile).toBeUndefined();
     expect(res.body.adapterConfig.instructionsFilePath).toBeUndefined();
   });
+
+  // TEC-7266: reconcile audit attribution when an agent acts on behalf of a
+  // user for adapterConfig writes. The authorization/lock policy already treats
+  // these as user-initiated (via responsibleUserId); the activity log and the
+  // config revision must record the responsible user too.
+  function onBehalfOfActor(overrides: Record<string, unknown> = {}) {
+    return {
+      type: "agent",
+      agentId: "agent-editor",
+      companyId: "company-1",
+      onBehalfOfUserId: "user-abc",
+      onBehalfOfMemberships: [
+        { companyId: "company-1", status: "active", membershipRole: "editor" },
+      ],
+      source: "agent_key",
+      ...overrides,
+    };
+  }
+
+  it("attributes the responsible user in the activity log and revision for agent-on-behalf adapterConfig writes", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: { model: "gpt-5.4" },
+    });
+
+    const res = await requestApp(
+      await createApp(onBehalfOfActor()),
+      (baseUrl) => request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterConfig: { model: "gpt-5.6" } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // The user-lock policy skips the agent allowlist for on-behalf writes, so
+    // the requested value is actually persisted (behavior preserved).
+    expect(res.body.adapterConfig).toMatchObject({ model: "gpt-5.6" });
+
+    // Activity log records the on-behalf attribution. Only agent.updated fires
+    // for on-behalf writes (the lock policy treats the actor as a user, so no
+    // agent.adapter_config_changed mutation entry is emitted).
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.updated",
+        details: expect.objectContaining({ onBehalfOfUserId: "user-abc" }),
+      }),
+    );
+
+    // Revision attribution matches the lock-policy actor (the responsible user).
+    const revisionOptions = mockAgentService.update.mock.calls[0]?.[2] as {
+      recordRevision?: { createdByAgentId?: string | null; createdByUserId?: string | null };
+    };
+    expect(revisionOptions.recordRevision).toMatchObject({
+      createdByAgentId: "agent-editor",
+      createdByUserId: "user-abc",
+    });
+  });
+
+  it("does not attribute a responsible user for direct-agent adapterConfig writes", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: { paperclipSkillSync: { desiredSkills: ["research"] } },
+    });
+
+    const res = await requestApp(
+      await createApp({
+        type: "agent",
+        agentId: "agent-editor",
+        companyId: "company-1",
+        source: "agent_key",
+      }),
+      (baseUrl) => request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterConfig: { paperclipSkillSync: { desiredSkills: ["research", "coding"] } } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updatedCall = mockLogActivity.mock.calls.find(
+      (call) => call[1]?.action === "agent.updated",
+    );
+    expect(updatedCall?.[1]).toMatchObject({ actorType: "agent" });
+    expect(updatedCall?.[1]?.details).not.toHaveProperty("onBehalfOfUserId");
+
+    const revisionOptions = mockAgentService.update.mock.calls[0]?.[2] as {
+      recordRevision?: { createdByAgentId?: string | null; createdByUserId?: string | null };
+    };
+    expect(revisionOptions.recordRevision).toMatchObject({
+      createdByAgentId: "agent-editor",
+      createdByUserId: null,
+    });
+  });
+
+  it("preserves direct-user attribution for adapterConfig writes", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: { model: "gpt-5.4" },
+    });
+
+    const res = await requestApp(
+      await createApp(boardActor()),
+      (baseUrl) => request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+        .send({ adapterConfig: { model: "gpt-5.6" } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updatedCall = mockLogActivity.mock.calls.find(
+      (call) => call[1]?.action === "agent.updated",
+    );
+    expect(updatedCall?.[1]).toMatchObject({ actorType: "user" });
+    expect(updatedCall?.[1]?.details).not.toHaveProperty("onBehalfOfUserId");
+
+    const revisionOptions = mockAgentService.update.mock.calls[0]?.[2] as {
+      recordRevision?: { createdByUserId?: string | null };
+    };
+    expect(revisionOptions.recordRevision).toMatchObject({
+      createdByUserId: "local-board",
+    });
+  });
 });

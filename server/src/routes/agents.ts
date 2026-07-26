@@ -3450,7 +3450,14 @@ export function agentRoutes(
     const agent = await svc.update(id, patchData, {
       recordRevision: {
         createdByAgentId: actor.agentId,
-        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        // When an agent acts on behalf of a user, the authorization and lock
+        // policy treat the request as user-initiated (via responsibleUserId).
+        // Mirror that here so the revision attributes the responsible user
+        // rather than dropping to null. Direct-user (including board) writes
+        // keep recording actor.actorId; direct-agent writes stay null.
+        createdByUserId: actor.actorType === "user"
+          ? actor.actorId
+          : (req.actor.onBehalfOfUserId ?? null),
         source: "patch",
       },
     });
@@ -3469,7 +3476,17 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: {
+        ...summarizeAgentUpdateDetails(patchData),
+        // When an agent acts on behalf of a user, the authorization and lock
+        // policy treat the request as user-initiated, but getActorInfo still
+        // reports the agent actor. Record the responsible user on adapterConfig
+        // updates so the activity trail reflects the on-behalf attribution.
+        // Omitted for direct-agent and direct-user writes.
+        ...(touchesAdapterConfiguration && req.actor.onBehalfOfUserId
+          ? { onBehalfOfUserId: req.actor.onBehalfOfUserId }
+          : {}),
+      },
     });
 
     if (adapterConfigMutation) {
