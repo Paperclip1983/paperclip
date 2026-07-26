@@ -180,6 +180,13 @@ export function agentRoutes(
     "agentsMdPath",
   ] as const;
   const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
+  // Instruction *bundle-definition* keys an agent must never set — these point
+  // the managed instructions bundle at an arbitrary host location and must be
+  // rejected with 403, not silently stripped. Concrete path pointers
+  // (instructionsFilePath/agentsMdPath) are NOT sensitive: they are dropped by
+  // the agent adapterConfig allowlist like any other non-allowlisted field.
+  const AGENT_SENSITIVE_INSTRUCTIONS_BUNDLE_KEYS: readonly string[] = KNOWN_INSTRUCTIONS_BUNDLE_KEYS
+    .filter((key) => !KNOWN_INSTRUCTIONS_PATH_KEYS.has(key));
 
   const router = Router();
   const svc = agentService(db);
@@ -1701,9 +1708,10 @@ export function agentRoutes(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
     path = "adapterConfig",
+    keys: readonly string[] = KNOWN_INSTRUCTIONS_BUNDLE_KEYS,
   ) {
     if (req.actor.type !== "agent" || !adapterConfig) return;
-    const changedSensitiveKeys = KNOWN_INSTRUCTIONS_BUNDLE_KEYS
+    const changedSensitiveKeys = keys
       .filter((key) => adapterConfig[key] !== undefined)
       .map((key) => `${path}.${key}`);
     if (changedSensitiveKeys.length === 0) return;
@@ -3256,6 +3264,28 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
+      // Security-sensitive fields must be rejected with 403 by the existing
+      // permission checks — not silently stripped by the allowlist. Evaluate
+      // the ORIGINAL requested config (before the allowlist drops non-sensitive
+      // extras) so the allowlist can never neuter these boundaries. Host-executed
+      // workspace commands and instruction *bundle-definition* keys are rejected;
+      // concrete path pointers and other non-sensitive fields stay strippable.
+      assertNoAgentHostWorkspaceCommandMutation(
+        req,
+        collectAgentAdapterWorkspaceCommandPaths(adapterConfig),
+      );
+      assertNoAgentInstructionsConfigMutation(
+        req,
+        adapterConfig,
+        "adapterConfig",
+        AGENT_SENSITIVE_INSTRUCTIONS_BUNDLE_KEYS,
+      );
+      // User/board callers still gate instruction-path changes through the
+      // protected-change permission. Agent callers never reach here for
+      // sensitive keys (rejected above) and have path pointers stripped below.
+      if (responsibleUserId !== null && adapterConfigTouchesInstructionsConfig(adapterConfig)) {
+        await assertCanManageInstructionsPath(req, existing);
+      }
       const allowlist = enforceAgentAdapterConfigAllowlist({
         existing: asRecord(existing.adapterConfig) ?? {},
         requested: adapterConfig,
@@ -3299,11 +3329,6 @@ export function agentRoutes(
       strippedAdapterConfigMutation = allowlist.strippedPaths.length > 0
         ? { strippedPaths: allowlist.strippedPaths, fields: allowlist.fields }
         : null;
-      assertNoAgentAdapterConfigMutation(req, allowlist.requested);
-      const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(allowlist.requested);
-      if (changingInstructionsConfig) {
-        await assertCanManageInstructionsPath(req, existing);
-      }
       patchData.adapterConfig = allowlist.requested;
     }
 
