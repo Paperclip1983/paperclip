@@ -1143,14 +1143,14 @@ export function agentRoutes(
   function enforceAgentAdapterConfigAllowlist(input: {
     existing: Record<string, unknown>;
     requested: Record<string, unknown>;
-    responsibleUserId: string | null;
+    isAgentCaller: boolean;
   }): {
     requested: Record<string, unknown>;
     strippedPaths: string[];
     lockedPaths: string[];
     fields: Array<{ path: string; type: string; count: number }>;
   } {
-    if (input.responsibleUserId !== null) {
+    if (!input.isAgentCaller) {
       return { requested: input.requested, strippedPaths: [], lockedPaths: [], fields: [] };
     }
 
@@ -3289,7 +3289,7 @@ export function agentRoutes(
       const allowlist = enforceAgentAdapterConfigAllowlist({
         existing: asRecord(existing.adapterConfig) ?? {},
         requested: adapterConfig,
-        responsibleUserId,
+        isAgentCaller: req.actor.type === "agent",
       });
       if (allowlist.lockedPaths.length > 0) {
         const refusedMutation: AdapterConfigMutation = {
