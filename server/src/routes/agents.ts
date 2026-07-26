@@ -1147,8 +1147,21 @@ export function agentRoutes(
       return { requested: input.requested, strippedPaths: [], lockedPaths: [], fields: [] };
     }
 
+    // Compare each requested path against the existing config so that a no-op
+    // patch (an agent re-sending a value identical to the current one) is not
+    // recorded as a strip. `changedAdapterConfigPaths({}, requested)` yields the
+    // top-level keys the agent actually sent; we intentionally keep that
+    // key-space (a partial patch must not treat omitted existing keys as
+    // changes) and drop paths whose requested value already matches existing.
     const requestedPaths = changedAdapterConfigPaths({}, input.requested);
-    const strippedPaths = requestedPaths.filter((path) => path !== "paperclipSkillSync.desiredSkills");
+    const strippedPaths = requestedPaths.filter(
+      (path) =>
+        path !== "paperclipSkillSync.desiredSkills" &&
+        !isDeepStrictEqual(
+          readAdapterConfigPath(input.existing, path),
+          readAdapterConfigPath(input.requested, path),
+        ),
+    );
     const lockedPaths = strippedPaths.filter((path) =>
       adapterConfigPathIsUserLocked(input.existing, path),
     );
