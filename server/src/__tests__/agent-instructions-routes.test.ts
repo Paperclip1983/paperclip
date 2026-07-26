@@ -871,6 +871,92 @@ describe("agent instructions bundle routes", () => {
     expect(JSON.stringify(mockIssueService.addComment.mock.calls)).not.toContain("test-placeholder");
   });
 
+  it("does not record a strip when an agent re-sends a value identical to the existing config", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        model: "gpt-5.4",
+        paperclipSkillSync: { desiredSkills: ["research"] },
+      },
+    });
+
+    const res = await requestApp(await createApp({
+      type: "agent",
+      agentId: "agent-editor",
+      companyId: "company-1",
+      source: "agent_key",
+    }), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+      .send({
+        adapterConfig: {
+          model: "gpt-5.4",
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updatePatch = mockAgentService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(updatePatch.adapterConfig).toMatchObject({ model: "gpt-5.4" });
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.adapter_config_changed",
+        details: expect.objectContaining({
+          changedCount: 0,
+          skippedCount: 0,
+          strippedCount: 0,
+        }),
+      }),
+    );
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "agent.adapter_config_change_stripped" }),
+    );
+  });
+
+  it("still records a strip when an agent introduces a new value for a disallowed field", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        model: "gpt-5.4",
+      },
+    });
+
+    const res = await requestApp(await createApp({
+      type: "agent",
+      agentId: "agent-editor",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_key",
+    }, linkedIssueDb()), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+      .send({
+        adapterConfig: {
+          model: "gpt-5.6",
+        },
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const updatePatch = mockAgentService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(updatePatch.adapterConfig).toMatchObject({ model: "gpt-5.4" });
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "agent.adapter_config_change_stripped",
+        details: expect.objectContaining({
+          fields: [{ path: "model", type: "string", count: 1 }],
+          changedCount: 0,
+          skippedCount: 0,
+          strippedCount: 1,
+        }),
+      }),
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "44444444-4444-4444-8444-444444444444",
+      expect.stringContaining("Stripped fields: 1 (`model`)"),
+      expect.any(Object),
+    );
+  });
+
   it("ignores replace semantics and preserves config when an agent sends only disallowed fields", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent(),
