@@ -788,6 +788,36 @@ describe("agent instructions bundle routes", () => {
     expect(JSON.stringify(mockIssueService.addComment.mock.calls)).not.toContain("new-secret-value");
   });
 
+  it("authorizes before recording a denied agent adapter config attempt", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        model: "gpt-5.4",
+        _userLocked: ["model"],
+      },
+    });
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      reason: "deny_missing_grant",
+      explanation: "Missing agent_config:update grant",
+    });
+
+    const res = await requestApp(await createApp({
+      type: "agent",
+      agentId: "agent-editor",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_key",
+    }, linkedIssueDb()), (baseUrl) => request(baseUrl)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+      .send({ adapterConfig: { model: "gpt-5.6" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
   it("strips unlocked agent fields, records the strip, and does not introduce env values", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent(),

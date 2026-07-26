@@ -3224,6 +3224,13 @@ export function agentRoutes(
     }
 
     const patchData = { ...(req.body as Record<string, unknown>) };
+    const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
+    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
+      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
+    );
+    if (!profileOnlyChange) {
+      await assertCanUpdateAgent(req, existing);
+    }
     const actor = getActorInfo(req);
     const responsibleUserId = req.actor.userId ?? req.actor.onBehalfOfUserId ?? null;
     let adapterConfigMutation: AdapterConfigMutation | null = null;
@@ -3398,14 +3405,8 @@ export function agentRoutes(
         },
       );
     }
-    const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
-    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
-      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
-    );
     if (profileOnlyChange) {
       await assertCanApplyAgentProfileChange(req, existing);
-    } else {
-      await assertCanUpdateAgent(req, existing);
     }
 
     const agent = await svc.update(id, patchData, {
